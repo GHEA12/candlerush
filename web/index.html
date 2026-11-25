@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CandleRush — real-time candle trading on MagicBlock Ephemeral Rollups</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0b0e14; color: #e6e9ef; }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .sub { color: #9aa4b2; margin: 0 0 20px; }
+  .card { background: #12161f; border: 1px solid #232a38; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .price { font-size: 44px; font-weight: 700; }
+  .meta { color: #9aa4b2; font-size: 14px; }
+  canvas { width: 100%; height: 220px; display: block; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px 8px; border-bottom: 1px solid #232a38; text-align: left; font-size: 14px; }
+  button { font-size: 16px; padding: 10px 18px; border-radius: 10px; border: 0; cursor: pointer; }
+  .long { background: #16a34a; color: white; }
+  .short { background: #dc2626; color: white; }
+  .ghost { background: #1c2330; color: #e6e9ef; border: 1px solid #2c3648; }
+  input[type=text] { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #2c3648; background: #0b0e14; color: #e6e9ef; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; color: #9aa4b2; max-height: 160px; overflow: auto; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🕯️ CandleRush</h1>
+  <p class="sub">A 60-second candle-trading game. Every tap moves the price. Room and player state live on a
+  <b>MagicBlock Ephemeral Rollup</b> (Solana devnet) so taps land in ~50&nbsp;ms with zero fees, then settle back to Solana.</p>
+
+  <div class="card">
+    <label class="meta">Room address (PDA)</label>
+    <input id="roomInput" type="text" placeholder="Paste a room address, or open with ?room=&lt;address&gt;" />
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" id="watchBtn">Watch room</button>
+      <span class="meta" id="connStatus">not connected</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div>
+        <div class="meta">PRICE</div>
+        <div class="price" id="price">—</div>
+        <div class="meta" id="roomMeta">tick — · longs — · shorts — · status —</div>
+      </div>
+      <div>
+        <div class="meta">SOURCE</div>
+        <div id="source" style="font-weight:600">—</div>
+        <div class="meta">Reads try the Ephemeral Rollup first, then base-layer Solana.</div>
+      </div>
+    </div>
+    <canvas id="chart" width="840" height="220"></canvas>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Leaderboard</h3>
+    <table>
+      <thead><tr><th>Player</th><th>Score</th><th>Taps</th><th>Position</th></tr></thead>
+      <tbody id="board"><tr><td colspan="4" class="meta">No room loaded yet.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Play with your own devnet keypair</h3>
+    <p class="meta">Judges: the fastest full demo is the CLI in the repo (<code>npm run lifecycle</code>), which creates a room,
+    delegates it, plays a round with bots on the ER and settles it. If you have a funded devnet keypair JSON, you can also
+    join the watched room and tap from here — your key never leaves this page.</p>
+    <div class="row">
+      <input type="file" id="keyFile" accept=".json" />
+      <button class="ghost" id="joinBtn" disabled>Join room</button>
+      <button class="ghost" id="delegateBtn" disabled>Delegate my player account</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="long" id="longBtn" disabled>▲ LONG (tap)</button>
+      <button class="short" id="shortBtn" disabled>▼ SHORT (tap)</button>
+      <span class="meta" id="myStats"></span>
+    </div>
+    <div id="log" style="margin-top:12px"></div>
+  </div>
+
+  <p class="meta">Program: <code>GiAkPEGUwF2HQuVQUatQbz2N8yzE2JfoofcxaBQujHdX</code> (Solana devnet) ·
+  ER validator: Asia (devnet-as.magicblock.app) · Built for Solana Blitz v10.</p>
+</main>
+
+<script type="module">
+import {
+  Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction,
+} from "https://cdn.jsdelivr.net/npm/@solana/web3.js@1.98.2/+esm";
+import {
+  DELEGATION_PROGRAM_ID, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID,
+  delegateBufferPdaFromDelegatedAccountAndOwnerProgram,
+  delegationMetadataPdaFromDelegatedAccount, delegationRecordPdaFromDelegatedAccount,
+} from "https://cdn.jsdelivr.net/npm/@magicblock-labs/ephemeral-rollups-sdk@0.18.0/+esm";
+
+const PROGRAM_ID = new PublicKey("GiAkPEGUwF2HQuVQUatQbz2N8yzE2JfoofcxaBQujHdX");
+const ER_VALIDATOR = new PublicKey("MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57");
+const base = new Connection("https://api.devnet.solana.com", "confirmed");
+const er = new Connection("https://devnet-as.magicblock.app", "confirmed");
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $("log").textContent += m + "\n"; $("log").scrollTop = 1e6; };
+
+function parseRoom(d) {
+  return {
+    price: Number(d.readBigUInt64LE(40)), tick: Number(d.readBigUInt64LE(48)),
+    longs: Number(d.readBigUInt64LE(56)), shorts: Number(d.readBigUInt64LE(64)),
+    status: d.readUInt8(72), winner: new PublicKey(d.subarray(73, 105)).toBase58(),
+    bestScore: Number(d.readBigInt64LE(105)),
+  };
+}
+function parsePlayer(d) {
+  return {
+    player: new PublicKey(d.subarray(0, 32)).toBase58(), position: d.readInt8(64),
+    entryPrice: Number(d.readBigUInt64LE(65)), score: Number(d.readBigInt64LE(73)),
+    taps: Number(d.readBigUInt64LE(81)),
+  };
+}
+const playerPda = (room, player) =>
+  PublicKey.findProgramAddressSync([new TextEncoder().encode("player"), room.toBuffer(), player.toBuffer()], PROGRAM_ID)[0];
+
+let room = null, history = [], myKey = null, timer = null;
+
+async function readRoom() {
+  for (const [name, conn] of [["Ephemeral Rollup", er], ["Solana base layer", base]]) {
+    try {
+      const info = await conn.getAccountInfo(room);
+      if (info && info.data.length >= 114) return { state: parseRoom(info.data), source: name };
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+async function readPlayers() {
+  for (const conn of [er, base]) {
+    try {
+      const accounts = await conn.getProgramAccounts(PROGRAM_ID, {
+        filters: [{ dataSize: 96 }, { memcmp: { offset: 32, bytes: room.toBase58() } }],
+      });
+      if (accounts.length) return accounts.map((a) => parsePlayer(a.account.data));
+    } catch { /* try next */ }
+  }
+  return [];
+}
+
+async function tick() {
+  if (!room) return;
+  const res = await readRoom();
+  if (!res) { $("connStatus").textContent = "room not found yet"; return; }
+  const { state, source } = res;
+  $("connStatus").textContent = "live";
+  $("source").textContent = source;
+  $("price").textContent = (state.price / 100).toFixed(2);
+  $("roomMeta").textContent =
+    `tick ${state.tick} · longs ${state.longs} · shorts ${state.shorts} · ` +
+    (state.status === 1 ? `ENDED · winner ${state.winner.slice(0, 8)}… · best ${state.bestScore}` : "OPEN");
+  if (!history.length || history[history.length - 1] !== state.price) {
+    history.push(state.price); if (history.length > 300) history.shift();
+    draw();
+  }
+  const players = await readPlayers();
+  players.sort((a, b) => b.score - a.score);
+  $("board").innerHTML = players.length
+    ? players.map((p) => `<tr><td>${p.player.slice(0, 8)}…</td><td>${p.score}</td><td>${p.taps}</td><td>${p.position > 0 ? "LONG" : p.position < 0 ? "SHORT" : "—"}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="meta">No players yet.</td></tr>`;
+  if (myKey) {
+    const mine = players.find((p) => p.player === myKey.publicKey.toBase58());
+    if (mine) $("myStats").textContent = `my score ${mine.score} · taps ${mine.taps}`;
+  }
+}
+
+function draw() {
+  const c = $("chart"), ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (history.length < 2) return;
+  const min = Math.min(...history), max = Math.max(...history), pad = Math.max(5, (max - min) * 0.15);
+  const y = (v) => c.height - ((v - (min - pad)) / ((max + pad) - (min - pad))) * c.height;
+  ctx.strokeStyle = "#232a38"; ctx.beginPath();
+  for (let i = 1; i < 5; i++) { ctx.moveTo(0, (c.height / 5) * i); ctx.lineTo(c.width, (c.height / 5) * i); }
+  ctx.stroke();
+  ctx.strokeStyle = history[history.length - 1] >= history[0] ? "#16a34a" : "#dc2626";
+  ctx.lineWidth = 2; ctx.beginPath();
+  history.forEach((v, i) => { const x = (i / (history.length - 1)) * c.width; i ? ctx.lineTo(x, y(v)) : ctx.moveTo(x, y(v)); });
+  ctx.stroke();
+}
+
+function watch() {
+  const val = $("roomInput").value.trim();
+  if (!val) return;
+  room = new PublicKey(val);
+  history = [];
+  clearInterval(timer);
+  timer = setInterval(tick, 400);
+  tick();
+  $("joinBtn").disabled = !myKey;
+  $("delegateBtn").disabled = !myKey;
+  log("watching room " + val);
+}
+$("watchBtn").onclick = watch;
+
+const params = new URLSearchParams(location.search);
+if (params.get("room")) { $("roomInput").value = params.get("room"); watch(); }
+
+$("keyFile").onchange = async (e) => {
+  const text = await e.target.files[0].text();
+  myKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(text)));
+  log("loaded keypair " + myKey.publicKey.toBase58());
+  $("joinBtn").disabled = !room;
+  $("delegateBtn").disabled = !room;
+  $("longBtn").disabled = false;
+  $("shortBtn").disabled = false;
+};
+
+function tagBuf(tag, extra = new Uint8Array(0)) {
+  const t = new Uint8Array(8 + extra.length);
+  new DataView(t.buffer).setBigUint64(0, BigInt(tag), true);
+  t.set(extra, 8);
+  return t;
+}
+async function sendIx(conn, ix, signers, label) {
+  const tx = new Transaction().add(ix);
+  const sig = await conn.sendTransaction(tx, signers, { skipPreflight: false });
+  await conn.confirmTransaction(sig, "confirmed");
+  log(label + ": " + sig);
+}
+
+$("joinBtn").onclick = async () => {
+  const pda = playerPda(room, myKey.publicKey);
+  const ix = new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: myKey.publicKey, isSigner: true, isWritable: true },
+      { pubkey: room, isSigner: false, isWritable: false },
+      { pubkey: pda, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: tagBuf(1),
+  });
+  await sendIx(base, ix, [myKey], "join");
+};
+
+$("delegateBtn").onclick = async () => {
+  const pda = playerPda(room, myKey.publicKey);
+  const ix = new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: myKey.publicKey, isSigner: true, isWritable: true },
+      { pubkey: pda, isSigner: false, isWritable: true },
+      { pubkey: PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: delegateBufferPdaFromDelegatedAccountAndOwnerProgram(pda, PROGRAM_ID), isSigner: false, isWritable: true },
+      { pubkey: delegationRecordPdaFromDelegatedAccount(pda), isSigner: false, isWritable: true },
+      { pubkey: delegationMetadataPdaFromDelegatedAccount(pda), isSigner: false, isWritable: true },
+      { pubkey: DELEGATION_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: tagBuf(2, ER_VALIDATOR.toBuffer()),
+  });
+  await sendIx(base, ix, [myKey], "delegate");
+};
+
+async function tap(dir) {
+  const pda = playerPda(room, myKey.publicKey);
+  const ix = new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: myKey.publicKey, isSigner: true, isWritable: false },
+      { pubkey: pda, isSigner: false, isWritable: true },
+      { pubkey: room, isSigner: false, isWritable: true },
+    ],
+    data: tagBuf(3, Uint8Array.from([dir & 0xff])),
+  });
+  await sendIx(er, ix, [myKey], dir > 0 ? "LONG tap" : "SHORT tap");
+}
+$("longBtn").onclick = () => tap(1);
+$("shortBtn").onclick = () => tap(-1);
+</script>
+</body>
+</html>
